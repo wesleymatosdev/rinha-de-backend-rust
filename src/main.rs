@@ -1,7 +1,7 @@
 pub mod handlers;
 pub mod payment_processor;
 
-use crate::handlers::publish_payment;
+use crate::handlers::{dequeue_payment, publish_payment};
 use async_nats::Client;
 use axum::{Router, body::Bytes, extract::State, routing::post};
 
@@ -16,6 +16,12 @@ async fn get_nats_client() -> Client {
 #[tokio::main]
 async fn main() {
     let client = get_nats_client().await;
+
+    tokio::task::spawn({
+        let client = client.clone();
+        async move { dequeue_payment(client).await }
+    });
+
     let app = Router::new()
         .route(
             "/payments",
