@@ -4,8 +4,12 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=myuser
+      - POSTGRES_PASSWORD=mypassword
+      - POSTGRES_DB=payments
+      - RUST_LOG=rinha_de_backend_rust=debug
       - NATS_URL=nats://nats:4222
       - DEFAULT_PAYMENT_URL=http://payment-processor-default:8080
       - FALLBACK_PAYMENT_URL=http://payment-processor-fallback:8080
@@ -18,13 +22,15 @@ services:
     depends_on:
       nats:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
       # redis:
       #   condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: '0.30'
-          memory: '75MB'
+          cpus: '0.2'
+          memory: '25MB'
 
   api02:
     <<: *api01
@@ -50,8 +56,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.4'
-          memory: '100MB'
+          cpus: '0.2'
+          memory: '70MB'
 
   nats:
     image: nats:2.10.16-alpine3.19
@@ -73,11 +79,40 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '0.2'
+          cpus: '0.5'
           memory: '50MB'
+
+  postgres:
+    image: postgres:17.5-alpine # Specifies the PostgreSQL image and version
+    container_name: my-postgres-db # Assigns a name to the container
+    restart: always # Ensures the container restarts automatically
+    environment:
+      POSTGRES_DB: payments # Sets the default database name
+      POSTGRES_USER: myuser # Sets the database user
+      POSTGRES_PASSWORD: mypassword # Sets the database password
+    ports:
+      - "5432:5432" # Maps host port 5432 to container port 5432
+    volumes:
+      - postgres_data:/var/lib/postgresql/data # Persists data using a named volume
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql # Mount initialization script
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myuser -d payments"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.4'
+          memory: '70MB'
+
 
 volumes:
   nats_data:
+    driver: local
+  postgres_data: # Defines the named volume for data persistence
     driver: local
 
 networks:

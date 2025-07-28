@@ -4,6 +4,7 @@ use async_nats::jetstream::{Context, consumer, stream::Config};
 use futures_util::TryStreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use sqlx::{Executor, Pool};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
@@ -82,9 +83,18 @@ struct CircuitBreaker {
     fallback: Arc<AsyncRecloser>,
 }
 
-enum CallType {
+enum Gateway {
     Default,
     Fallback,
+}
+
+impl Gateway {
+    fn to_string(&self) -> &'static str {
+        match self {
+            Gateway::Default => "default",
+            Gateway::Fallback => "fallback",
+        }
+    }
 }
 
 impl CircuitBreaker {
@@ -97,26 +107,55 @@ impl CircuitBreaker {
 
     pub async fn handle_payment_request(
         &self,
-        data: CallType,
+        data: Gateway,
         client: Client,
         payment: Payment,
     ) -> Result<(), recloser::Error<anyhow::Error>> {
         let payer = pay(client, payment);
         match data {
-            CallType::Default => self.default.call(payer(get_default_payment_url())),
-            CallType::Fallback => self.fallback.call(payer(get_fallback_payment_url())),
+            Gateway::Default => self.default.call(payer(get_default_payment_url())),
+            Gateway::Fallback => self.fallback.call(payer(get_fallback_payment_url())),
         }
         .await
     }
 }
 
+async fn save_payment_to_db(
+    pg_pool: Pool<sqlx::Postgres>,
+    payment: Payment,
+    gateway: Gateway,
+) -> Result<(), anyhow::Error> {
+    let sql = r#"
+        INSERT INTO payments (correlation_id, amount, requested_at, gateway)
+        VALUES ($1, $2, $3, $4)
+    "#;
+
+    let query = sqlx::query(sql)
+        .bind(payment.correlation_id)
+        .bind(payment.amount)
+        .bind(payment.requested_at)
+        .bind(gateway.to_string());
+
+    let result = pg_pool.execute(query).await;
+
+    match result {
+        Err(e) => {
+            log::error!("Error saving payment to db, e = {:?}", e);
+        }
+        Ok(_) => {}
+    }
+
+    Ok(())
+}
+
 async fn process_payment(
     circuit_breaker: CircuitBreaker,
+    pg_pool: Pool<sqlx::Postgres>,
     http_client: Client,
     payment: Payment,
 ) -> Result<(), anyhow::Error> {
     let default_request = circuit_breaker
-        .handle_payment_request(CallType::Default, http_client.clone(), payment.clone())
+        .handle_payment_request(Gateway::Default, http_client.clone(), payment.clone())
         .await;
 
     match default_request {
@@ -135,12 +174,15 @@ async fn process_payment(
         }
         Ok(_) => {
             log::debug!("Payment processed successfully with default payment URL.");
+            save_payment_to_db(pg_pool, payment.clone(), Gateway::Default)
+                .await
+                .expect("Failed to save payment to database");
             return Ok(());
         }
     };
 
     let fallback_request = circuit_breaker
-        .handle_payment_request(CallType::Fallback, http_client.clone(), payment.clone())
+        .handle_payment_request(Gateway::Fallback, http_client.clone(), payment.clone())
         .await;
 
     match fallback_request {
@@ -159,6 +201,9 @@ async fn process_payment(
         }
         Ok(_) => {
             log::error!("Payment processed successfully with default payment URL.");
+            save_payment_to_db(pg_pool, payment.clone(), Gateway::Fallback)
+                .await
+                .expect("Failed to save payment to database");
             return Ok(());
         }
     }
@@ -173,6 +218,7 @@ async fn get_stream(ctx: Context) -> consumer::pull::Stream {
         .create_stream(Config {
             name: "payments".to_string(),
             subjects: vec!["payments".to_string()],
+            retention: async_nats::jetstream::stream::RetentionPolicy::Interest,
             ..Default::default()
         })
         .await
@@ -183,6 +229,8 @@ async fn get_stream(ctx: Context) -> consumer::pull::Stream {
             "payment-processor",
             consumer::pull::Config {
                 durable_name: Some("payment-processor".to_string()),
+                max_deliver: 3,
+                ack_policy: consumer::AckPolicy::Explicit,
                 replay_policy: consumer::ReplayPolicy::Instant,
                 ..Default::default()
             },
@@ -196,23 +244,24 @@ async fn get_stream(ctx: Context) -> consumer::pull::Stream {
         .expect("Failed to get messages from consumer")
 }
 
-pub async fn dequeue_payment(ctx: Context) {
+pub async fn dequeue_payment(ctx: Context, pg_pool: Pool<sqlx::Postgres>) {
     let http_client = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .expect("Failed to create HTTP client");
     let circuit_breaker = CircuitBreaker::new();
 
-    let stream = get_stream(ctx.clone()).await;
-    stream
+    get_stream(ctx.clone())
+        .await
         .try_for_each_concurrent(1000, |message| {
             let http_client = http_client.clone();
+            let pg_pool = pg_pool.clone();
             let circuit_breaker = circuit_breaker.clone();
             async move {
                 let payment: Payment = serde_json::from_slice(&message.payload)
                     .expect("Failed to deserialize payment");
 
-                match process_payment(circuit_breaker, http_client, payment).await {
+                match process_payment(circuit_breaker, pg_pool, http_client, payment).await {
                     Ok(_) => message.ack().await.expect("Failed to ack message"),
                     Err(_) => {
                         message
