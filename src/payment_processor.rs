@@ -218,7 +218,7 @@ async fn get_stream(ctx: Context) -> consumer::pull::Stream {
         .create_stream(Config {
             name: "payments".to_string(),
             subjects: vec!["payments".to_string()],
-            retention: async_nats::jetstream::stream::RetentionPolicy::Interest,
+            retention: async_nats::jetstream::stream::RetentionPolicy::WorkQueue,
             ..Default::default()
         })
         .await

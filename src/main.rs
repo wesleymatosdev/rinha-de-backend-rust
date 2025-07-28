@@ -1,17 +1,26 @@
 pub mod handlers;
 pub mod payment_processor;
 
+use std::sync::Arc;
+
 use async_nats::{
     Client,
     jetstream::{self, Context},
 };
-use axum::{
-    Router,
-    body::Bytes,
-    extract::{Query, State},
-    routing::{get, post},
-};
+use http_body_util::BodyExt;
+use hyper::{Request, server::conn::http1, service::service_fn};
+use hyper_util::rt::TokioTimer;
+// use axum::{
+//     Router,
+//     body::Bytes,
+//     extract::{Query, State},
+//     routing::{get, post},
+// };
 use sqlx::{Pool, postgres::PgPoolOptions};
+// use viz::{
+//     Bytes, Request, RequestExt, serve,
+//     types::{Json, Query, State},
+// };
 
 use crate::{
     handlers::{PaymentSummaryFilters, payment_summary, publish_payment, purge_payments},
@@ -67,35 +76,66 @@ async fn main() {
         }
     });
 
-    let app = Router::new()
-        .route(
-            "/payments",
-            post(|state: State<AppState>, payment: Bytes| async move {
-                let _ = publish_payment(state.context.clone(), payment).await;
-            }),
-        )
-        .route(
-            "/payments-summary",
-            get(
-                |state: State<AppState>, filters: Query<PaymentSummaryFilters>| async move {
-                    let response = payment_summary(filters.0.clone(), state.pg_pool.clone()).await;
+    // let app = viz::Router::new()
+    //     .post("/payments", async |mut req: viz::Request| {
+    //         let State(state) = req.extract::<(State<AppState>)>().await?;
 
-                    axum::Json(response)
-                },
-            ),
-        )
-        .route(
-            "/purge-payments",
-            post(|state: State<AppState>| async move {
-                purge_payments(state.pg_pool.clone(), state.context.clone()).await;
+    //         let payment = req.bytes().await?;
 
-                axum::Json("Payments purged successfully")
-            }),
-        )
-        .with_state(AppState {
-            pg_pool: pg_pool,
-            context: context,
-        });
+    //         let _ = publish_payment(state.context.clone(), payment).await;
+
+    //         Ok(())
+    //     })
+    //     .get("/payments-summary", async |mut req: viz::Request| {
+    //         let (State(state), Query(filters)) = req
+    //             .extract::<(State<AppState>, Query<PaymentSummaryFilters>)>()
+    //             .await?;
+
+    //         let response = payment_summary(filters, state.pg_pool.clone()).await;
+
+    //         Ok(Json(response))
+    //     })
+    //     .post("/purge-payments", async |mut req: viz::Request| {
+    //         let (State(state)) = req.extract::<(State<AppState>)>().await?;
+
+    //         purge_payments(state.pg_pool.clone(), state.context.clone()).await;
+
+    //         Ok(Json("Payments purged successfully"))
+    //     })
+    //     .with(State::new(AppState {
+    //         context: context.clone(),
+    //         pg_pool: pg_pool.clone(),
+    //     }));
+
+    // let app = Router::new()
+    //     .route(
+    //         "/payments",
+    //         post(|state: State<AppState>, payment: Bytes| async move {
+    //             let _ = publish_payment(state.context.clone(), payment).await;
+    //         }),
+    //     )
+    //     .route(
+    //         "/payments-summary",
+    //         get(
+    //             |state: State<AppState>, filters: Query<PaymentSummaryFilters>| async move {
+    //                 let response = payment_summary(filters.0.clone(), state.pg_pool.clone()).await;
+
+    //                 axum::Json(response)
+    //             },
+    //         ),
+    //     )
+    //     .route(
+    //         "/purge-payments",
+    //         post(|state: State<AppState>| async move {
+    //             purge_payments(state.pg_pool.clone(), state.context.clone()).await;
+
+    //             axum::Json("Payments purged successfully")
+    //         }),
+    //     )
+    //     .with_state(AppState {
+    //         pg_pool: pg_pool,
+    //         context: context,
+    //     });
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
 
@@ -103,9 +143,85 @@ async fn main() {
         .await
         .expect("Failed to bind TCP listener");
 
-    log::info!("Server running on http://0.0.0.0:{port}");
+    // // let server = serve(listener, app).await;
+    // if let Err(e) = serve(listener, app).await {
+    //     eprintln!("Failed to start server: {}", e);
+    //     std::process::exit(1);
+    // }
 
-    axum::serve(listener, app)
+    log::info!("Server running on http://0.0.0.0:{port}");
+    let (stream, _) = listener
+        .accept()
         .await
-        .expect("Failed to start server");
+        .expect("Failed to accept connection");
+    // let (tcp, _) = listener.accept().await;
+
+    let io = hyper_util::rt::tokio::TokioIo::new(stream);
+
+    let state = Arc::new(AppState {
+        context: context.clone(),
+        pg_pool: pg_pool.clone(),
+    });
+
+    tokio::task::spawn(async move {
+        if let Err(err) = http1::Builder::new()
+            .timer(TokioTimer::new())
+            .serve_connection(
+                io,
+                service_fn(move |req| {
+                    let state = state.clone();
+                    async move { handler(req, state).await }
+                }),
+            )
+            .await
+        {
+            eprintln!("Error serving connection: {}", err);
+        }
+    });
+
+    // log::info!("Server running on http://0.0.0.0:{port}");
+
+    // axum::serve(listener, app)
+    //     .await
+    //     .expect("Failed to start server");
+}
+
+async fn handler(
+    req: Request<hyper::body::Incoming>,
+    state: Arc<AppState>,
+) -> Result<hyper::Response<String>, anyhow::Error> {
+    match (req.method(), req.uri().path()) {
+        (&hyper::Method::POST, "/payments") => {
+            // let (parts, body) = req.into_parts();
+            // let body = req.into_body();
+            // let a = body.collect().await?;
+            // let bytes = a.await.map_err(hyper::Error::from)?;
+            // Handle payment publishing
+            // publish_payment(state.context.clone(), a).await;
+            Ok(hyper::Response::new("Payment published".to_string()))
+        }
+        (&hyper::Method::GET, "/payments-summary") => {
+            let filters = req
+                .uri()
+                .query()
+                .and_then(|query| serde_urlencoded::from_str::<PaymentSummaryFilters>(query).ok())
+                .unwrap_or_default();
+
+            // req.uri().query()
+            // Handle payment summary
+            // let filters = PaymentSummaryFilters::default(); // Replace with actual filter extraction logic
+            let response = payment_summary(filters, state.pg_pool.clone()).await;
+            let json_string =
+                serde_json::to_string(&response).map_err(|e| anyhow::Error::from(e))?;
+            Ok(hyper::Response::new(json_string))
+        }
+        (&hyper::Method::POST, "/purge-payments") => {
+            // Handle purging payments
+            purge_payments(state.pg_pool.clone(), state.context.clone()).await;
+            Ok(hyper::Response::new(
+                "Payments purged successfully".to_string(),
+            ))
+        }
+        _ => Ok(hyper::Response::new("404 Not Found".to_string())),
+    }
 }
