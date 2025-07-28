@@ -18,10 +18,6 @@ async fn get_nats_client() -> Client {
 
 #[tokio::main]
 async fn main() {
-    // init URLs for payment processing
-    let _ = payment_processor::get_default_payment_url();
-    let _ = payment_processor::get_fallback_payment_url();
-
     let client = get_nats_client().await;
     let context = jetstream::new(client);
 

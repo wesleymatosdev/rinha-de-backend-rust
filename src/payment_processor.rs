@@ -168,27 +168,15 @@ async fn process_payment(
     ))
 }
 
-pub async fn dequeue_payment(ctx: Context) {
-    let circuit_breaker = CircuitBreaker::new();
-
-    let http_client = Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("Failed to create HTTP client");
-
-    let Ok(stream) = ctx
+async fn get_stream(ctx: Context) -> consumer::pull::Stream {
+    let stream = ctx
         .create_stream(Config {
             name: "payments".to_string(),
             subjects: vec!["payments".to_string()],
-            // replay_policy: ReplayPolicy::Original,
-            // deliver_group: Some("payment-processor".to_string()),
             ..Default::default()
         })
         .await
-    else {
-        log::error!("Failed to create or get stream");
-        return;
-    };
+        .expect("Failed to create or get stream");
 
     let consumer = stream
         .get_or_create_consumer(
@@ -202,12 +190,21 @@ pub async fn dequeue_payment(ctx: Context) {
         .await
         .expect("Failed to get or create consumer");
 
-    let stream = consumer
+    consumer
         .messages()
         .await
-        .expect("Failed to get messages from consumer");
+        .expect("Failed to get messages from consumer")
+}
 
-    let tries = stream
+pub async fn dequeue_payment(ctx: Context) {
+    let http_client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("Failed to create HTTP client");
+    let circuit_breaker = CircuitBreaker::new();
+
+    let stream = get_stream(ctx.clone()).await;
+    stream
         .try_for_each_concurrent(1000, |message| {
             let http_client = http_client.clone();
             let circuit_breaker = circuit_breaker.clone();
@@ -231,7 +228,6 @@ pub async fn dequeue_payment(ctx: Context) {
                 Ok(())
             }
         })
-        .await;
-
-    tries.expect("Failed to stream messages");
+        .await
+        .expect("Failed to stream messages");
 }
