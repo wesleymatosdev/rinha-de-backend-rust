@@ -7,16 +7,19 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - NATS_URL=nats://nats:4222
+      - DEFAULT_PAYMENT_URL=http://payment-processor-default:8080
+      - FALLBACK_PAYMENT_URL=http://payment-processor-fallback:8080
       - PORT=3000
     volumes:
       - .:/usr/src/app
     networks:
       - backend
+      - payment-processor
     depends_on:
       nats:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+      # redis:
+      #   condition: service_healthy
     deploy:
       resources:
         limits:
@@ -28,6 +31,7 @@ services:
     hostname: api02
     networks:
       - backend
+      - payment-processor
     volumes:
       - .:/usr/src/app
 
@@ -40,7 +44,7 @@ services:
     networks:
       - backend
     depends_on:
-      - redis
+      # - redis
       - api01
       - api02
     deploy:
@@ -51,7 +55,8 @@ services:
 
   nats:
     image: nats:2.10.16-alpine3.19
-    command: -m 8222
+    # command: -m 8222
+    command: -js -sd /data -m 8222
     ports:
       - "4222:4222"
       - "8222:8222"
@@ -63,11 +68,17 @@ services:
       interval: 14s
     networks:
       - backend
+    volumes:
+      - nats_data:/data
     deploy:
       resources:
         limits:
           cpus: '0.2'
           memory: '50MB'
+
+volumes:
+  nats_data:
+    driver: local
 
 networks:
   backend:

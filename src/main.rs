@@ -1,9 +1,12 @@
-pub mod handlers;
 pub mod payment_processor;
 
-use crate::handlers::{dequeue_payment, publish_payment};
-use async_nats::Client;
+use async_nats::{
+    Client,
+    jetstream::{self, Context},
+};
 use axum::{Router, body::Bytes, extract::State, routing::post};
+
+use crate::payment_processor::dequeue_payment;
 
 async fn get_nats_client() -> Client {
     let nats_url =
@@ -15,21 +18,31 @@ async fn get_nats_client() -> Client {
 
 #[tokio::main]
 async fn main() {
+    // init URLs for payment processing
+    let _ = payment_processor::get_default_payment_url();
+    let _ = payment_processor::get_fallback_payment_url();
+
     let client = get_nats_client().await;
+    let context = jetstream::new(client);
 
     tokio::task::spawn({
-        let client = client.clone();
-        async move { dequeue_payment(client).await }
+        let context = context.clone();
+        async move {
+            let _dequeue = dequeue_payment(context).await;
+        }
     });
 
     let app = Router::new()
         .route(
             "/payments",
-            post(|client: State<Client>, payment: Bytes| async move {
-                publish_payment(client.0, payment).await;
+            post(|context: State<Context>, payment: Bytes| async move {
+                context
+                    .publish("payments", payment)
+                    .await
+                    .expect("Failed to publish payment to NATS");
             }),
         )
-        .with_state(client);
+        .with_state(context);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
 
